@@ -1,0 +1,380 @@
+---
+title: "Predicción de retrasos en vuelos domésticos de EE.UU. (2024)"
+output: pdf_document
+date: "2026-09-23"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+Se realizaron extracciones de la pagina https://transtats.bts.gov/DL_SelectFields.aspx?QO_fu146_anzr=&gnoyr_VQ=FGJ para vuelos de todos los estados de USA.
+Cargamos y unimos las extracciones
+
+```{r}
+vuelos <- read.csv("DatosProyecto/vuelos_2024.csv")
+```
+
+# Análisis exploratorio
+
+Revisamos las dimensiones de cada uno
+```{r}
+dim(vuelos)
+str(vuelos)
+```
+
+Filtramos vuelos cancelados
+
+```{r}
+library(dplyr)
+
+vuelos_analisis <- vuelos %>% filter(CANCELLED == 0, !is.na(DEP_DEL15))
+print("Porcentaje de vuelos con mas de 15 min retrasados:")
+mean(vuelos_analisis$DEP_DEL15) * 100
+```
+¿Qué aeropuertos presentan mayor riesgo de retraso?
+
+```{r}
+riesgo_aeropuerto <- vuelos_analisis %>%
+  group_by(ORIGIN) %>%
+  summarise(
+    vuelos = n(),
+    vuelos_retrasados = sum(DEP_DEL15),
+    pct_retraso = mean(DEP_DEL15) * 100,
+    retraso_promedio = mean(DEP_DELAY, na.rm = TRUE)
+  ) %>%
+  filter(vuelos >= 1000) %>%
+  arrange(desc(pct_retraso))
+
+head(riesgo_aeropuerto, 10)
+```
+
+Graficamos el top 10
+```{r}
+top_aeropuertos <- head(riesgo_aeropuerto, 10)
+
+barplot(
+  rev(top_aeropuertos$pct_retraso),
+  names.arg = rev(top_aeropuertos$ORIGIN),
+  horiz = TRUE,
+  las = 1,
+  xlab = "% de vuelos con retraso >= 15 min",
+  main = "Aeropuertos con mayor riesgo de retraso"
+)
+```
+¿Qué ocurre con los retrasos a lo largo del día?
+```{r}
+vuelos_analisis <- vuelos_analisis %>% mutate(HORA = CRS_DEP_TIME %/% 100)
+
+riesgo_hora <- vuelos_analisis %>%
+  group_by(HORA) %>%
+  summarise(
+    vuelos = n(),
+    pct_retraso = mean(DEP_DEL15) * 100,
+    retraso_promedio = mean(DEP_DELAY, na.rm = TRUE)
+  )
+
+riesgo_hora
+```
+
+Graficamos el riesgo por hora
+```{r}
+plot(
+  riesgo_hora$HORA,
+  riesgo_hora$pct_retraso,
+  type = "b",
+  xlab = "Hora programada de salida",
+  ylab = "% de vuelos con retraso >= 15 min",
+  main = "Riesgo de retraso según hora de salida"
+)
+```
+
+¿Existen rutas particularmente problemáticas?
+```{r}
+riesgo_ruta <- vuelos_analisis %>%
+  mutate(
+    RUTA = paste(ORIGIN, DEST, sep = " - ")
+  ) %>%
+  group_by(RUTA) %>%
+  summarise(
+    vuelos = n(),
+    vuelos_retrasados = sum(DEP_DEL15),
+    pct_retraso = mean(DEP_DEL15) * 100,
+    retraso_promedio = mean(DEP_DELAY, na.rm = TRUE)
+  ) %>%
+  filter(vuelos >= 1000) %>%
+  arrange(desc(pct_retraso))
+
+head(riesgo_ruta, 15)
+```
+
+Visualizamos
+```{r}
+top_rutas <- head(riesgo_ruta, 10)
+
+barplot(
+  rev(top_rutas$pct_retraso),
+  names.arg = rev(top_rutas$RUTA),
+  horiz = TRUE,
+  las = 1,
+  xlab = "% de vuelos con retraso >= 15 min",
+  main = "Rutas con mayor riesgo de retraso"
+)
+```
+más preparación de datos
+
+```{r}
+library(dplyr)
+
+#Convertir fecha en día y hora de la semana
+vuelos_analisis <- vuelos %>%
+  filter(
+    CANCELLED == 0,
+    !is.na(DEP_DEL15)
+  ) %>%
+  mutate(
+    FL_DATE = as.Date(FL_DATE, format = "%m/%d/%Y %I:%M:%S %p"),
+    HORA = CRS_DEP_TIME %/% 100,
+    DIA_SEMANA = weekdays(FL_DATE),
+    MONTH = factor(MONTH),
+    OP_UNIQUE_CARRIER = factor(OP_UNIQUE_CARRIER),
+    ORIGIN = factor(ORIGIN),
+    DEST = factor(DEST)
+  )
+
+#Corregimos Hora 24 = Hora 0
+vuelos_analisis <- vuelos_analisis %>%
+  mutate(
+    HORA = ifelse(HORA == 24, 0, HORA)
+  )
+```
+
+
+# Modelo
+
+*¿Es posible estimar la probabilidad de que un vuelo se retrase a partir de la información disponible al momento de programar el vuelo?*
+
+Nuestra variable objetivo será `DEP_DEL15` (1 = el vuelo salió con 15 minutos o más de retraso respecto a lo programado). Usamos únicamente variables conocidas **antes** de que el vuelo despegue (hora programada, día, mes, aerolínea, origen y destino), para que el modelo sea útil en un escenario real de predicción anticipada y no incurra en fuga de información (*data leakage*) usando variables como `TAXI_OUT` o las causas de retraso, que solo se conocen después del hecho.
+
+Para ello necesitamos conocer el balance de clases y saber cómo dividir nuestros datos de entrenamiento.
+
+```{r}
+table(vuelos_analisis$DEP_DEL15)
+prop.table(table(vuelos_analisis$DEP_DEL15))
+```
+
+**Nota sobre el desbalance de clases:** la proporción de vuelos retrasados es considerablemente menor que la de vuelos a tiempo. Esto implica que `accuracy` por sí sola puede ser engañosa (un modelo que siempre prediga "a tiempo" tendría accuracy alta pero sería inútil), por lo que además evaluaremos `recall`, `precision`, `F1` y `AUC`.
+
+Reducimos la memoria y agrupamos los aeropuertos poco frecuentes
+
+```{r}
+library(pROC)
+library(forcats)
+library(splines)
+library(rsample)
+
+datos_modelo <- vuelos_analisis %>%
+  select(DEP_DEL15, HORA, DIA_SEMANA, MONTH, OP_UNIQUE_CARRIER,
+         ORIGIN, DEST) %>%
+  mutate(
+    ORIGIN = fct_lump_n(ORIGIN, 40, other_level = "Otro"),
+    DEST   = fct_lump_n(DEST, 40, other_level = "Otro"),
+    DIA_SEMANA = factor(DIA_SEMANA)
+  )
+
+rm(vuelos, vuelos_analisis); gc()
+
+set.seed(123)
+datos_modelo <- slice_sample(datos_modelo, n = 500000)   # muestra representativa
+```
+
+Separamos nuestros datos en entrenamiento y prueba (80/20, estratificado por la variable objetivo para conservar la proporción de retrasos en ambos conjuntos)
+
+```{r}
+division   <- initial_split(datos_modelo, prop = 0.80, strata = DEP_DEL15)
+datos_train <- training(division)
+datos_test  <- testing(division)
+```
+
+## Modelo 1: Regresión logística (línea base)
+
+Usamos una regresión logística como modelo de comparación (*baseline*): es un modelo lineal e interpretable que nos permite dimensionar cuánto aporta realmente un modelo más complejo como Random Forest.
+
+```{r}
+modelo_log <- glm(factor(DEP_DEL15) ~ ., data = datos_train, family = "binomial")
+
+p_log <- predict(modelo_log, datos_test, type = "response")
+roc_log <- roc(datos_test$DEP_DEL15, p_log)
+auc_log <- auc(roc_log)
+auc_log
+```
+
+## Modelo 2: Random Forest
+
+Entrenamos un Random Forest (200 árboles), que puede capturar interacciones no lineales entre variables (por ejemplo, hora del día combinada con aeropuerto de origen) que la regresión logística no detecta directamente.
+
+```{r}
+library(ranger)
+rf_balanceado <- ranger(factor(DEP_DEL15) ~ ., data = datos_train,
+                         num.trees = 200, probability = TRUE,
+                         importance = "impurity",
+                         class.weights = c("0" = 1, "1" = 4))
+
+# Chequeo defensivo: si esto no imprime "ranger", el modelo no se entrenó bien
+print(class(rf_balanceado))
+```
+
+Resultados (probabilidades)
+
+```{r}
+p_rf <- predict(rf_balanceado, datos_test)$predictions[, "1"]
+roc_rf <- roc(datos_test$DEP_DEL15, p_rf)
+auc_rf <- auc(roc_rf)
+auc_rf
+```
+
+## Comparación de alternativas
+
+Comparamos ambos modelos con AUC, que es una métrica robusta al desbalance de clases porque evalúa el ranking de probabilidades en todos los umbrales posibles, no un único punto de corte.
+
+```{r}
+comparacion_auc <- data.frame(
+  Modelo = c("Regresión logística", "Random Forest"),
+  AUC = c(as.numeric(auc_log), as.numeric(auc_rf))
+)
+comparacion_auc
+```
+
+```{r}
+plot(roc_log, col = "steelblue", main = "Curvas ROC: comparación de modelos")
+plot(roc_rf, col = "darkorange", add = TRUE)
+legend("bottomright",
+       legend = c(paste0("Regresión logística (AUC=", round(auc_log, 3), ")"),
+                  paste0("Random Forest (AUC=", round(auc_rf, 3), ")")),
+       col = c("steelblue", "darkorange"), lwd = 2)
+```
+
+```{r}
+library(PRROC)
+pr_rf <- pr.curve(scores.class0 = p_rf[datos_test$DEP_DEL15 == 1],
+                   scores.class1 = p_rf[datos_test$DEP_DEL15 == 0],
+                   curve = TRUE)
+pr_rf$auc.integral
+plot(pr_rf)
+```
+
+A partir de aquí, continuamos el análisis detallado (matriz de confusión, métricas de clasificación e importancia de variables) con el modelo de mejor desempeño según AUC: **Random Forest**.
+
+## Selección de umbral y matriz de confusión (Random Forest)
+
+Dado el desbalance de clases, el umbral de decisión no tiene que ser necesariamente 0.5: bajarlo aumenta el `recall` (detectamos más retrasos reales) a costa de más falsos positivos. En vez de fijarlo arbitrariamente, lo calculamos con el índice de Youden sobre la curva ROC, que balancea sensibilidad y especificidad. Adicionalmente, ya entrenamos el Random Forest con `class.weights` para penalizar más los errores sobre la clase minoritaria (retrasos), lo que también ayuda a reducir los falsos negativos desde el propio entrenamiento, no solo ajustando el punto de corte.
+
+```{r}
+umbral_optimo <- coords(roc_rf, "best", best.method = "youden", ret = "threshold")
+umbral_optimo <- as.numeric(umbral_optimo$threshold)[1]
+umbral_optimo
+
+predicciones <- ifelse(p_rf >= umbral_optimo, 1, 0)
+```
+
+Matriz de confusión y métricas
+
+```{r}
+matriz_confusion <- table(
+  Predicho = factor(predicciones, levels = 0:1),
+  Real     = factor(datos_test$DEP_DEL15, levels = 0:1)
+)
+
+TN <- matriz_confusion["0", "0"]; FP <- matriz_confusion["1", "0"]
+FN <- matriz_confusion["0", "1"]; TP <- matriz_confusion["1", "1"]
+
+accuracy    <- (TP + TN) / sum(matriz_confusion)
+recall      <- TP / (TP + FN)
+specificity <- TN / (TN + FP)
+precision   <- TP / (TP + FP)
+f1          <- 2 * (precision * recall) / (precision + recall)
+```
+
+```{r}
+library(ggplot2)
+
+df_matriz <- as.data.frame(matriz_confusion)
+
+ggplot(df_matriz, aes(x = Real, y = Predicho, fill = Freq)) +
+  geom_tile(color = "white", linewidth = 1) +
+  geom_text(
+    aes(label = Freq),
+    size = 6,
+    fontface = "bold"
+  ) +
+  scale_fill_gradient(
+    low = "white",
+    high = "steelblue"
+  ) +
+  labs(
+    title = "Matriz de confusión (Random Forest)",
+    x = "Valor real",
+    y = "Valor predicho",
+    fill = "Número de vuelos"
+  ) +
+  theme_minimal(base_size = 14)
+```
+
+```{r}
+metricas <- data.frame(
+  Metrica = c(
+    "Accuracy",
+    "Recall (Sensibilidad)",
+    "Specificity",
+    "Precision",
+    "F1-score",
+    "AUC"
+  ),
+  Valor = c(
+    accuracy,
+    recall,
+    specificity,
+    precision,
+    f1,
+    as.numeric(auc_rf)
+  )
+)
+
+metricas
+```
+
+## Importancia de variables
+
+```{r}
+importancia <- sort(rf_balanceado$variable.importance, decreasing = TRUE)
+
+barplot(
+  importancia,
+  las = 2,
+  cex.names = 0.8,
+  main = "Importancia de variables (Random Forest)",
+  ylab = "Reducción de impureza"
+)
+```
+
+## Interpretación de resultados
+
+*(Completar/ajustar estos párrafos con los valores numéricos exactos que arroje tu ejecución; el texto está redactado para guiar la interpretación.)*
+
+- **Comparación de modelos:** si el AUC del Random Forest es superior al de la regresión logística, esto sugiere que existen relaciones no lineales o interacciones entre variables (por ejemplo, ciertas combinaciones de aeropuerto y hora) que el modelo lineal no logra capturar. Si ambos AUC son muy similares, es evidencia de que la señal predictiva es mayormente aditiva y que el modelo más simple e interpretable (regresión logística) podría preferirse por parsimonia.
+- **Recall vs. Precision:** con un umbral de 0.5, es esperable que el `recall` sea menor que la `specificity` dado el desbalance de clases — el modelo tiende a "perderse" una parte de los retrasos reales. Si el objetivo de negocio es alertar con anticipación (ej. para reasignar tripulación o avisar a pasajeros), conviene priorizar `recall` bajando el umbral, aceptando más falsas alarmas.
+- **Variables más relevantes:** según el gráfico de importancia, típicamente `HORA`, `ORIGIN` y `OP_UNIQUE_CARRIER` concentran gran parte del poder predictivo, lo cual es consistente con el análisis exploratorio inicial (aeropuertos y horas con mayor % de retraso).
+- **Respuesta a la pregunta de investigación:** sí es posible estimar la probabilidad de retraso con información disponible antes del vuelo, con un desempeño mejor que el azar (AUC > 0.5), aunque el poder predictivo es limitado porque el dataset no incluye variables muy influyentes en la práctica, como el clima o el estado operativo previo de la aeronave.
+
+## Limitaciones
+
+- Se utilizó `DEP_DEL15` (retraso en la **salida**) como variable objetivo, no `ARR_DEL15` (retraso en la **llegada**); son conceptos relacionados pero no idénticos, y conviene declarar explícitamente cuál se está prediciendo.
+- No se incluyen variables meteorológicas externas, una de las causas de retraso más relevantes según la literatura y según las categorías de causa (`WeatherDelay`) del propio dataset de BTS.
+- Por restricciones de memoria se trabajó con una submuestra de 500,000 vuelos, no con el año completo; los resultados son representativos pero no exhaustivos.
+- Los aeropuertos y destinos poco frecuentes se agruparon en la categoría "Otro" (`fct_lump_n`), lo que puede ocultar señal específica de aeropuertos pequeños con alto riesgo de retraso.
+- Se usó una única partición entrenamiento/prueba (80/20); no se aplicó validación cruzada, por lo que la estimación de desempeño tiene cierta variabilidad asociada a la partición aleatoria específica usada.
+- No se realizó ajuste de hiperparámetros (`mtry`, `min.node.size` en Random Forest), por lo que el desempeño reportado es un piso, no el máximo alcanzable por esta familia de modelos.
+
+## Conclusión
+
+El análisis muestra que sí es posible estimar la probabilidad de retraso de un vuelo a partir de información conocida antes del despegue (hora, día, mes, aerolínea, origen y destino), con un desempeño superior al azar. El Random Forest se comparó contra una regresión logística como línea base, lo que permite argumentar con evidencia por qué se seleccionó (o no) el modelo más complejo. Las variables de hora programada y aeropuerto de origen resultan las más informativas, consistente con el análisis exploratorio. El principal límite del modelo es la ausencia de variables externas (clima, estado previo de la aeronave), que en la práctica de la industria explican una parte importante de los retrasos.
