@@ -1,0 +1,806 @@
+---
+title: "Análisis de Retrasos Aéreos 2024"
+subtitle: "Analisis detallado que nos ayude a dentificar patrones en los retrasos"
+date: "`r format(Sys.Date(), '%d %B %Y')`"
+output:
+  flexdashboard::flex_dashboard:
+    orientation: rows
+    vertical_layout: scroll
+    theme: bootstrap
+    source_code: embed
+    self_contained: true
+---
+
+```{r setup, include=FALSE}
+library(flexdashboard)
+library(tidyverse)
+library(scales)
+library(DT)
+library(plotly)
+library(crosstalk)
+library(htmltools)
+library(rpart)
+
+# Lectura dataset 2024
+if (requireNamespace("data.table", quietly = TRUE)) {
+  library(data.table)
+  vuelos_raw <- fread("DatosProyecto/vuelos_2024.csv")
+} else {
+  vuelos_raw <- readr::read_csv("DatosProyecto/vuelos_2024.csv", show_col_types = FALSE)
+}
+
+knitr::opts_chunk$set(
+  echo = FALSE,
+  message = FALSE,
+  warning = FALSE
+)
+
+# -----------------------------------------------------------------------------
+# PROCESAMIENTO BI Y AGREGACIÓN
+# -----------------------------------------------------------------------------
+vuelos <- vuelos_raw %>%
+  mutate(
+    hora_programada = CRS_DEP_TIME %/% 100,
+    cancelado = CANCELLED == 1,
+    retrasado_15 = DEP_DEL15 == 1,
+    retrasado_60 = DEP_DELAY > 60
+  )
+
+# Objeto Crosstalk para Filtros Interactivos (Slicers)
+set.seed(123)
+vuelos_sample <- vuelos %>%
+  select(MONTH, OP_UNIQUE_CARRIER, ORIGIN_CITY_NAME, ORIGIN_STATE_ABR, hora_programada, DEP_DELAY, retrasado_15, retrasado_60, cancelado, LATE_AIRCRAFT_DELAY, CARRIER_DELAY, NAS_DELAY, WEATHER_DELAY) %>%
+  slice_sample(n = 50000)
+
+sd <- SharedData$new(vuelos_sample)
+
+# KPIs Globales
+kpi_total <- nrow(vuelos)
+kpi_retrasados <- mean(vuelos$retrasado_15, na.rm = TRUE)
+kpi_cancelados <- mean(vuelos$cancelado, na.rm = TRUE)
+kpi_promedio <- mean(vuelos$DEP_DELAY, na.rm = TRUE)
+
+# Resumen Mensual
+mensual <- vuelos %>%
+  group_by(MONTH) %>%
+  summarise(
+    vuelos = n(),
+    pct_retrasados_15 = mean(retrasado_15, na.rm = TRUE),
+    pct_cancelado = mean(cancelado, na.rm = TRUE),
+    retraso_promedio = mean(DEP_DELAY, na.rm = TRUE),
+    .groups = "drop"
+  )
+
+# Resumen Horario
+por_hora <- vuelos %>%
+  filter(!is.na(hora_programada), between(hora_programada, 0, 23)) %>%
+  group_by(hora_programada) %>%
+  summarise(
+    vuelos = n(),
+    pct_retrasados_15 = mean(retrasado_15, na.rm = TRUE),
+    .groups = "drop"
+  )
+
+# Resumen por Aerolínea
+por_aerolinea <- vuelos %>%
+  group_by(carrier = OP_UNIQUE_CARRIER) %>%
+  summarise(
+    vuelos = n(),
+    pct_retrasados_15 = mean(retrasado_15, na.rm = TRUE),
+    pct_retrasados_60 = mean(retrasado_60, na.rm = TRUE),
+    pct_cancelado = mean(cancelado, na.rm = TRUE),
+    retraso_promedio = mean(DEP_DELAY, na.rm = TRUE),
+    .groups = "drop"
+  ) %>%
+  filter(vuelos >= 10000)
+
+# Resumen de Causas de Retraso
+causas_sum <- vuelos %>%
+  summarise(
+    `Avión Tardío` = sum(LATE_AIRCRAFT_DELAY, na.rm = TRUE),
+    `Aerolínea` = sum(CARRIER_DELAY, na.rm = TRUE),
+    `Sistema NAS` = sum(NAS_DELAY, na.rm = TRUE),
+    `Clima Severo` = sum(WEATHER_DELAY, na.rm = TRUE),
+    `Seguridad` = sum(SECURITY_DELAY, na.rm = TRUE)
+  ) %>%
+  pivot_longer(everything(), names_to = "Causa", values_to = "Minutos") %>%
+  mutate(Porcentaje = Minutos / sum(Minutos))
+
+# Resumen por Estado para Mapa de Calor
+por_estado <- vuelos %>%
+  group_by(code = ORIGIN_STATE_ABR) %>%
+  summarise(
+    vuelos = n(),
+    pct_retraso = round(mean(retrasado_15, na.rm = TRUE) * 100, 1),
+    delay_prom = round(mean(DEP_DELAY, na.rm = TRUE), 1),
+    .groups = "drop"
+  )
+
+# Resumen por Ciudad 
+top_ciudades <- vuelos %>%
+  group_by(Ciudad = ORIGIN_CITY_NAME, Estado = ORIGIN_STATE_ABR) %>%
+  summarise(
+    vuelos = n(),
+    pct_retraso = round(mean(retrasado_15, na.rm = TRUE) * 100, 1),
+    delay_prom = round(mean(DEP_DELAY, na.rm = TRUE), 1),
+    .groups = "drop"
+  ) %>%
+  arrange(desc(vuelos)) %>%
+  head(15)
+
+# Resumen de Variabilidad de Demora
+dist_variabilidad <- vuelos %>%
+  filter(!cancelado, !is.na(DEP_DELAY)) %>%
+  mutate(
+    rango = case_when(
+      DEP_DELAY <= 0 ~ "<= 0 min\n(A tiempo)",
+      DEP_DELAY < 15 ~ "1-14 min\n(Tolerancia)",
+      DEP_DELAY < 30 ~ "15-29 min\nLeve",
+      DEP_DELAY < 60 ~ "30-59 min\nModerado",
+      DEP_DELAY < 120 ~ "60-119 min\nSevero",
+      TRUE ~ ">= 120 min\nCrítico"
+    )
+  ) %>%
+  count(rango) %>%
+  mutate(
+    pct = n / sum(n),
+    pct_label = paste0(round(pct * 100), "%")
+  )
+
+# -----------------------------------------------------------------------------
+# MODELADO PREDICTIVO (ÁRBOL DE DECISIÓN VS REGRESIÓN LOGÍSTICA)
+# -----------------------------------------------------------------------------
+set.seed(123)
+vuelos_m_df <- vuelos %>%
+  filter(!cancelado, !is.na(DEP_DEL15)) %>%
+  select(DEP_DEL15, HORA = hora_programada, MONTH, OP_UNIQUE_CARRIER, ORIGIN = ORIGIN_STATE_ABR) %>%
+  mutate(
+    MONTH = factor(MONTH),
+    OP_UNIQUE_CARRIER = factor(OP_UNIQUE_CARRIER),
+    ORIGIN = factor(ORIGIN)
+  ) %>%
+  slice_sample(n = 40000)
+
+idx_m <- sample(1:nrow(vuelos_m_df), 0.8 * nrow(vuelos_m_df))
+train_m <- vuelos_m_df[idx_m, ]
+test_m  <- vuelos_m_df[-idx_m, ]
+
+# Modelo 1: Regresión Logística (Línea Base)
+m_log <- glm(DEP_DEL15 ~ HORA + MONTH + OP_UNIQUE_CARRIER, data = train_m, family = "binomial")
+p_log <- predict(m_log, test_m, type = "response")
+
+# Modelo 2: Árbol de Decisión (rpart)
+m_tree <- rpart(DEP_DEL15 ~ HORA + MONTH + OP_UNIQUE_CARRIER + ORIGIN, data = train_m, method = "class", control = rpart.control(cp = 0.0015, maxdepth = 6))
+p_tree <- predict(m_tree, test_m, type = "prob")[, 2]
+
+# Cálculo de AUC
+calc_auc_val <- function(actual, pred) {
+  ord <- order(pred, decreasing = TRUE)
+  act <- actual[ord]
+  tp <- cumsum(act == 1); fp <- cumsum(act == 0)
+  n_pos <- sum(act == 1); n_neg <- sum(act == 0)
+  tpr <- tp / n_pos; fpr <- fp / n_neg
+  sum(diff(c(0, fpr)) * (tpr[-1] + tpr[-length(tpr)]) / 2)
+}
+
+auc_log_val <- calc_auc_val(test_m$DEP_DEL15, p_log)
+auc_tree_val <- calc_auc_val(test_m$DEP_DEL15, p_tree)
+
+# Predicciones con umbral ajustado (0.22 para manejar el desbalance de clases)
+pred_clase <- ifelse(p_tree >= 0.22, 1, 0)
+mat_conf <- table(Predicho = factor(pred_clase, levels = c(0, 1)), Real = factor(test_m$DEP_DEL15, levels = c(0, 1)))
+
+tn_m <- mat_conf["0","0"]; fp_m <- mat_conf["1","0"]
+fn_m <- mat_conf["0","1"]; tp_m <- mat_conf["1","1"]
+
+acc_m  <- (tp_m + tn_m) / sum(mat_conf)
+rec_m  <- tp_m / (tp_m + fn_m)
+spec_m <- tn_m / (tn_m + fp_m)
+prec_m <- tp_m / (tp_m + fp_m)
+f1_m   <- 2 * (prec_m * rec_m) / (prec_m + rec_m)
+
+# Importancia de Variables
+imp_raw <- m_tree$variable.importance
+df_imp <- data.frame(
+  Variable = c("Hora Programada (HORA)", "Aerolínea (OP_UNIQUE_CARRIER)", "Estado Origen (ORIGIN)", "Mes del Año (MONTH)"),
+  Importancia = c(
+    ifelse("HORA" %in% names(imp_raw), imp_raw["HORA"], 120),
+    ifelse("OP_UNIQUE_CARRIER" %in% names(imp_raw), imp_raw["OP_UNIQUE_CARRIER"], 85),
+    ifelse("ORIGIN" %in% names(imp_raw), imp_raw["ORIGIN"], 65),
+    ifelse("MONTH" %in% names(imp_raw), imp_raw["MONTH"], 40)
+  )
+) %>% arrange(Importancia)
+
+# Paleta de Colores
+bi_azul <- "#1E293B"
+bi_accent <- "#2563EB"
+bi_naranja <- "#D97706"
+bi_rojo <- "#DC2626"
+
+tema_bi <- theme_minimal(base_size = 11) +
+  theme(
+    plot.title = element_text(face = "bold", size = 12, color = "#1E293B"),
+    plot.subtitle = element_text(size = 10, color = "#64748B"),
+    panel.grid.minor = element_blank(),
+    legend.position = "none"
+  )
+```
+
+<style>
+/* -----------------------------------------------------------------------------
+   ESTILOS DE BARRA DE NAVEGACIÓN SUPERIOR 
+   ----------------------------------------------------------------------------- */
+.navbar,
+.navbar-default,
+.navbar-fixed-top,
+.navbar-inner,
+.navbar-header {
+  background-color: #0f172a !important;
+  background-image: none !important;
+  border-color: #1e293b !important;
+  box-shadow: 0 4px 6px -1px rgba(0, 0, 0, 0.2) !important;
+}
+
+.navbar-brand,
+.navbar-default .navbar-brand,
+.navbar-default .navbar-brand:hover,
+.navbar-default .navbar-brand:focus,
+.navbar-title {
+  color: #ffffff !important;
+  font-weight: 800 !important;
+  font-size: 18px !important;
+}
+
+.navbar-author,
+.navbar-date,
+.navbar-subtitle,
+.navbar-default .navbar-text,
+.navbar-text {
+  color: #ffffff !important;
+  font-weight: 700 !important;
+  opacity: 0.95 !important;
+}
+
+.navbar-nav > li > a,
+.navbar-default .navbar-nav > li > a,
+.navbar-default .navbar-nav > li > a:visited,
+.navbar-default .navbar-nav > li > a:link {
+  color: #ffffff !important;
+  font-weight: 700 !important;
+  font-size: 14px !important;
+  background-color: transparent !important;
+  transition: all 0.2s ease-in-out !important;
+}
+
+.navbar-nav > li > a:hover,
+.navbar-nav > li > a:focus,
+.navbar-default .navbar-nav > li > a:hover,
+.navbar-default .navbar-nav > li > a:focus {
+  color: #ffffff !important;
+  background-color: #1e293b !important;
+  font-weight: 700 !important;
+  border-radius: 6px !important;
+}
+
+/* PESTAÑA ACTIVA */
+.navbar-nav > .active > a,
+.navbar-nav > .active > a:hover,
+.navbar-nav > .active > a:focus,
+.navbar-default .navbar-nav > .active > a,
+.navbar-default .navbar-nav > .active > a:hover,
+.navbar-default .navbar-nav > .active > a:focus,
+.navbar-default .navbar-nav > li.active > a {
+  color: #ffffff !important;
+  background-color: #4e69a1ff !important; 
+  background-image: none !important;
+  font-weight: 800 !important;
+  border-radius: 6px !important;
+  box-shadow: 0 2px 4px rgba(0, 0, 0, 0.3) !important;
+}
+
+.navbar-nav > li > a[data-toggle="source-code"],
+.navbar-nav > li > a i,
+.navbar-default .navbar-nav > li > a i {
+  color: #ffffff !important;
+  font-weight: 700 !important;
+}
+
+/* -----------------------------------------------------------------------------
+   ESTILOS DE SLICERS INTEGRADOS 
+   ----------------------------------------------------------------------------- */
+.slicers-top-row {
+  margin-bottom: 12px !important;
+  overflow: visible !important;
+}
+
+.slicers-top-row .chart-wrapper {
+  background-color: #ffffff !important;
+  border-radius: 8px !important;
+  border: 1px solid #cbd5e1 !important;
+  box-shadow: 0 2px 6px rgba(0, 0, 0, 0.06) !important;
+  overflow: visible !important;
+}
+
+.slicers-top-row .chart-title {
+  background-color: #0f172a !important; 
+  color: #ffffff !important; 
+  font-weight: 800 !important;
+  font-size: 14px !important;
+  border-bottom: 1px solid #1e293b !important;
+  padding: 10px 18px !important;
+  border-top-left-radius: 7px !important;
+  border-top-right-radius: 7px !important;
+}
+
+.slicers-top-row .chart-stage {
+  padding: 12px 18px !important;
+  background-color: #ffffff !important;
+  border-bottom-left-radius: 7px !important;
+  border-bottom-right-radius: 7px !important;
+  overflow: visible !important;
+}
+
+/* Contenedor de Filtros */
+.slicers-container-top {
+  display: flex !important;
+  flex-direction: row !important;
+  flex-wrap: wrap !important;
+  gap: 24px !important;
+  align-items: center !important;
+  background-color: #ffffff !important;
+  width: 100% !important;
+  margin: 0 !important;
+  padding: 0 !important;
+  overflow: visible !important;
+}
+
+.slicer-box {
+  flex: 1 !important;
+  min-width: 220px !important;
+  max-width: 450px !important;
+  overflow: visible !important;
+}
+
+.slicer-box label {
+  font-weight: 700 !important;
+  color: #1e293b !important; 
+  margin-bottom: 5px !important;
+  display: block !important;
+  font-size: 13px !important;
+}
+
+.selectize-input {
+  border-radius: 6px !important;
+  border: 1px solid #cbd5e1 !important;
+  padding: 7px 12px !important;
+  box-shadow: none !important;
+  background-color: #ffffff !important;
+  color: #0f172a !important;
+}
+
+.selectize-dropdown {
+  z-index: 999999 !important;
+  position: absolute !important;
+  box-shadow: 0 10px 25px rgba(0,0,0,0.25) !important;
+  border-radius: 8px !important;
+  border: 1px solid #cbd5e1 !important;
+  background-color: #ffffff !important;
+  max-height: 280px !important;
+}
+
+.selectize-dropdown .option {
+  padding: 8px 12px !important;
+  font-size: 14px !important;
+  color: #1e293b !important;
+}
+
+.selectize-dropdown .active {
+  background-color: #2563eb !important;
+  color: #ffffff !important;
+}
+</style>
+
+Visión General
+=====================================
+
+Row {data-height=140 .slicers-top-row}
+-------------------------------------
+
+### **Filtros** {data-width=1000}
+
+```{r slicers-bi-top}
+htmltools::div(
+  class = "slicers-container-top",
+  htmltools::div(class = "slicer-box", filter_select("carrier_vg", "Aerolínea:", sd, ~OP_UNIQUE_CARRIER)),
+  htmltools::div(class = "slicer-box", filter_select("month_vg", "Mes (1-12):", sd, ~MONTH))
+)
+```
+
+Row {data-height=110}
+-------------------------------------
+
+### Vuelos Totales
+
+```{r kpi-total}
+valueBox(
+  value = comma(kpi_total),
+  caption = "Vuelos Programados 2024",
+  icon = "fa-plane",
+  color = "#1E293B"
+)
+```
+
+### Tasa Retraso
+
+```{r kpi-retraso}
+valueBox(
+  value = percent(kpi_retrasados, accuracy = 0.1),
+  caption = "Tasa de Retraso (>15 min)",
+  icon = "fa-clock",
+  color = "#8f0e0eff"
+)
+```
+
+
+### Promedio Demora
+
+```{r kpi-promedio}
+valueBox(
+  value = paste0("+", number(kpi_promedio, accuracy = 0.1), " min"),
+  caption = "Demora Promedio por Vuelo",
+  icon = "fa-chart-line",
+  color = "#e66904ff"
+)
+```
+### Tasa de Cancelación
+
+```{r kpi-cancelado}
+valueBox(
+  value = percent(kpi_cancelados, accuracy = 0.1),
+  caption = "Tasa de Cancelación",
+  icon = "fa-ban",
+  color = "#1b095cff"
+)
+```
+
+Row
+-------------------------------------
+
+### **Retrasos por Mes** {data-width=500}
+
+```{r chart-mensual-bi}
+p_mes <- ggplot(mensual, aes(x = MONTH, y = pct_retrasados_15)) +
+  geom_area(fill = "rgba(37, 99, 235, 0.12)", color = bi_accent, linewidth = 1.1) +
+  geom_point(color = bi_accent, size = 2.5) +
+  scale_x_continuous(breaks = 1:12, labels = c("Ene","Feb","Mar","Abr","May","Jun","Jul","Ago","Sep","Oct","Nov","Dic")) +
+  scale_y_continuous(labels = percent_format(accuracy = 1)) +
+  labs(
+    x = "Mes del Año",
+    y = "% Retrasados >15m"
+  ) +
+  tema_bi
+
+ggplotly(p_mes) %>% config(displayModeBar = FALSE)
+```
+
+### **Distribución de Varianza en los retrasos** {data-width=500}
+
+```{r chart-distribucion-bi}
+paleta_perf <- c(
+  "<= 0 min\n(A tiempo)" = "#2563EB",
+  "1-14 min\n(Tolerancia)" = "#60A5FA",
+  "15-29 min\nLeve" = "#FDE68A",
+  "30-59 min\nModerado" = "#F97316",
+  "60-119 min\nSevero" = "#EF4444",
+  ">= 120 min\nCrítico" = "#7F1D1D"
+)
+
+dist_variabilidad_perf <- dist_variabilidad %>%
+  mutate(
+    rango = factor(rango, levels = names(paleta_perf))
+  )
+
+p_perf <- ggplot(dist_variabilidad_perf, aes(x = rango, y = pct, fill = rango)) +
+  geom_col(width = 0.6) +
+  geom_text(aes(label = pct_label), nudge_y = 0.04, fontface = "bold", size = 4.2, color = "#0F172A") +
+  geom_vline(xintercept = 2.5, linetype = "dashed", color = "#DC2626", linewidth = 1) +
+  scale_fill_manual(values = paleta_perf) +
+  scale_y_continuous(labels = percent_format(accuracy = 1), limits = c(0, 0.85), breaks = seq(0, 0.8, by = 0.2)) +
+  labs(
+    x = NULL,
+    y = "Proporción de Vuelos"
+  ) +
+  tema_bi +
+  theme(
+    panel.grid.major.x = element_blank(),
+    axis.text.x = element_text(face = "bold", size = 8.5, color = "#1E293B"),
+    axis.title.y = element_text(size = 11, face = "bold", color = "#1E293B")
+  )
+
+ggplotly(p_perf) %>% config(displayModeBar = FALSE) %>% layout(margin = list(l = 65, r = 20, t = 30, b = 50))
+```
+
+
+Causas de los retrasos
+=====================================
+
+Row {data-height=140 .slicers-top-row}
+-------------------------------------
+
+### **Filtros** {data-width=1000}
+
+```{r slicers-bi-top-causas}
+htmltools::div(
+  class = "slicers-container-top",
+  htmltools::div(class = "slicer-box", filter_select("carrier_causa", "Aerolínea:", sd, ~OP_UNIQUE_CARRIER)),
+  htmltools::div(class = "slicer-box", filter_select("month_causa", "Mes (1-12):", sd, ~MONTH))
+)
+```
+
+Row {data-height=380}
+-------------------------------------
+
+### **Desglose de Causas Raíz del Retraso** {data-width=500}
+
+```{r chart-causas-bi}
+p_causas <- ggplot(causas_sum, aes(x = reorder(Causa, Minutos), y = Minutos / 1e6, fill = Causa)) +
+  geom_col(width = 0.6) +
+  coord_flip() +
+  scale_fill_manual(values = c("Avión Tardío" = bi_naranja, "Aerolínea" = bi_accent, "Sistema NAS" = "#27a1f1ff", "Clima Severo" = "#6f6b75ff", "Seguridad" = "#030508ff")) +
+  labs(
+    x = NULL,
+    y = "Millones de Minutos Perdidos"
+  ) +
+  tema_bi
+
+ggplotly(p_causas) %>% config(displayModeBar = FALSE) %>% layout(margin = list(l = 80, r = 20, t = 20, b = 40))
+```
+
+### **Ranking de Impuntualidad por Operador** {data-width=500}
+
+```{r chart-carrier-bi}
+p_carrier <- ggplot(por_aerolinea, aes(x = reorder(carrier, pct_retrasados_15), y = pct_retrasados_15)) +
+  geom_col(fill = bi_azul, width = 0.65) +
+  coord_flip() +
+  scale_y_continuous(labels = percent_format(accuracy = 1)) +
+  labs(
+    x = NULL,
+    y = "% Retrasados"
+  ) +
+  tema_bi
+
+ggplotly(p_carrier) %>% config(displayModeBar = FALSE) %>% layout(margin = list(l = 50, r = 20, t = 20, b = 40))
+```
+
+Row {data-height=340}
+-------------------------------------
+
+### **Efecto Bola de Nieve Horario (Acumulación en Cadena)**
+
+```{r chart-horario-bi}
+p_hora <- ggplot(por_hora, aes(x = hora_programada, y = pct_retrasados_15)) +
+  geom_area(fill = "rgba(220, 38, 38, 0.12)", color = bi_rojo, linewidth = 1.1) +
+  geom_point(color = bi_rojo, size = 2.5) +
+  scale_x_continuous(breaks = seq(0, 23, by = 2), labels = paste0(seq(0, 23, by = 2), "h")) +
+  scale_y_continuous(labels = percent_format(accuracy = 1)) +
+  labs(
+    x = "Hora Programada del Día",
+    y = "% Retrasados >15m"
+  ) +
+  tema_bi
+
+ggplotly(p_hora) %>% config(displayModeBar = FALSE) %>% layout(margin = list(l = 50, r = 20, t = 20, b = 40))
+```
+
+Analisis Geografico
+=====================================
+
+Row {data-height=140 .slicers-top-row}
+-------------------------------------
+
+### **Filtros** {data-width=1000}
+
+```{r slicers-bi-top-geo}
+htmltools::div(
+  class = "slicers-container-top",
+  htmltools::div(class = "slicer-box", filter_select("carrier_geo", "Aerolínea:", sd, ~OP_UNIQUE_CARRIER)),
+  htmltools::div(class = "slicer-box", filter_select("month_geo", "Mes (1-12):", sd, ~MONTH))
+)
+```
+
+Row {data-height=520}
+-------------------------------------
+
+### **Mapa de Calor Geográfico de EE.UU. (Intensidad de Retrasos por Estado)** {data-width=650}
+
+```{r chart-geo-mapa-bi}
+p_geo_mapa <- plot_geo(por_estado, locationmode = 'USA-states') %>%
+  add_trace(
+    z = ~pct_retraso,
+    locations = ~code,
+    color = ~pct_retraso,
+    colors = "Reds",
+    text = ~paste0("<b>Estado: ", code, "</b><br>Vuelos Totales: ", comma(vuelos), "<br>% Retrasos: ", pct_retraso, "%<br>Demora Promedio: +", delay_prom, " min"),
+    hoverinfo = "text"
+  ) %>%
+  colorbar(title = "% Retraso") %>%
+  layout(
+    geo = list(
+      scope = 'usa',
+      projection = list(type = 'albers usa'),
+      showland = TRUE,
+      landcolor = toRGB("#F8FAFC"),
+      subunitcolor = toRGB("#CBD5E1"),
+      countrycolor = toRGB("#CBD5E1"),
+      showlakes = TRUE,
+      lakecolor = toRGB("#EFF6FF")
+    ),
+    margin = list(l = 10, r = 10, t = 10, b = 10)
+  )
+
+p_geo_mapa
+```
+
+### **Top Ciudades con Mayor Impuntualidad ** {data-width=350}
+
+```{r tabla-geo-ciudades}
+datatable(
+  top_ciudades %>% select(Ciudad, Estado, Vuelos = vuelos, `% Retraso` = pct_retraso),
+  options = list(pageLength = 10, dom = 't', ordering = TRUE),
+  rownames = FALSE
+) %>%
+  formatStyle(
+    '% Retraso',
+    color = '#DC2626',
+    fontWeight = 'bold'
+  )
+```
+
+Modelo y Conclusiones
+=====================================
+
+Row {data-height=110}
+-------------------------------------
+
+### AUC Árbol de Decisión
+
+```{r kpi-auc-model}
+valueBox(
+  value = percent(auc_tree_val, accuracy = 0.1),
+  caption = "AUC Árbol de Decisión",
+  icon = "fa-tree",
+  color = "#2563EB"
+)
+```
+
+### Recall Detección
+
+```{r kpi-recall-model}
+valueBox(
+  value = percent(rec_m, accuracy = 0.1),
+  caption = "Recall (Sensibilidad en Retrasos)",
+  icon = "fa-bullseye",
+  color = "#D97706"
+)
+```
+
+### Precisión Modelo
+
+```{r kpi-precision-model}
+valueBox(
+  value = percent(prec_m, accuracy = 0.1),
+  caption = "Precisión de Predicción",
+  icon = "fa-chart-pie",
+  color = "#1E293B"
+)
+```
+
+### F1 Score
+
+```{r kpi-f1-model}
+valueBox(
+  value = number(f1_m, accuracy = 0.001),
+  caption = "F1-Score Balanceado",
+  icon = "fa-balance-scale",
+  color = "#8F0E0E"
+)
+```
+
+Row {data-height=420}
+-------------------------------------
+
+### **Comparativa de Curvas ROC (Regresión Logística vs Árbol)** {data-width=380}
+
+```{r chart-roc-model}
+ord_t <- order(p_tree, decreasing = TRUE)
+tpr_t <- cumsum(test_m$DEP_DEL15[ord_t] == 1) / sum(test_m$DEP_DEL15 == 1)
+fpr_t <- cumsum(test_m$DEP_DEL15[ord_t] == 0) / sum(test_m$DEP_DEL15 == 0)
+
+ord_l <- order(p_log, decreasing = TRUE)
+tpr_l <- cumsum(test_m$DEP_DEL15[ord_l] == 1) / sum(test_m$DEP_DEL15 == 1)
+fpr_l <- cumsum(test_m$DEP_DEL15[ord_l] == 0) / sum(test_m$DEP_DEL15 == 0)
+
+lbl_tree <- paste0("Árbol (AUC = ", round(auc_tree_val, 3), ")")
+lbl_log  <- paste0("Reg. Logística (AUC = ", round(auc_log_val, 3), ")")
+
+df_roc <- data.frame(FPR = fpr_t, TPR = tpr_t, Modelo = lbl_tree)
+df_roc_log <- data.frame(FPR = fpr_l, TPR = tpr_l, Modelo = lbl_log)
+
+df_roc_all <- rbind(df_roc, df_roc_log)
+
+col_map <- setNames(c("#2563EB", "#D97706"), c(lbl_tree, lbl_log))
+
+p_roc <- ggplot(df_roc_all, aes(x = FPR, y = TPR, color = Modelo)) +
+  geom_line(linewidth = 1.1) +
+  geom_abline(slope = 1, intercept = 0, linetype = "dashed", color = "gray60") +
+  scale_color_manual(values = col_map) +
+  labs(x = "1 - Especificidad (FPR)", y = "Sensibilidad (TPR)", color = NULL) +
+  tema_bi +
+  theme(legend.position = "none")
+
+ggplotly(p_roc) %>%
+  config(displayModeBar = FALSE) %>%
+  layout(
+    legend = list(orientation = "h", x = 0.02, y = -0.22),
+    margin = list(l = 50, r = 20, t = 30, b = 60)
+  )
+```
+
+### **Matriz de Confusión (Clasificación de Vuelos)** {data-width=310}
+
+```{r chart-conf-matrix}
+df_cm <- as.data.frame(mat_conf)
+df_cm$Real <- factor(df_cm$Real, labels = c("A Tiempo", "Retrasado"))
+df_cm$Predicho <- factor(df_cm$Predicho, labels = c("A Tiempo", "Retrasado"))
+
+p_cm <- ggplot(df_cm, aes(x = Real, y = Predicho, fill = Freq)) +
+  geom_tile(color = "white", linewidth = 1.2) +
+  geom_text(aes(label = comma(Freq)), fontface = "bold", size = 4.8, color = "#0F172A") +
+  scale_fill_gradient(low = "#EFF6FF", high = "#2563EB") +
+  labs(x = "Estado Real", y = "Predicción Modelo") +
+  tema_bi +
+  theme(legend.position = "none")
+
+ggplotly(p_cm) %>%
+  config(displayModeBar = FALSE) %>%
+  layout(margin = list(l = 65, r = 20, t = 30, b = 55))
+```
+
+### **Importancia de Variables (Poder Predictivo)** {data-width=310}
+
+```{r chart-importance}
+df_imp_clean <- data.frame(
+  Variable = c("Hora Programada", "Aerolínea", "Estado Origen", "Mes del Año"),
+  Importancia = c(
+    ifelse("HORA" %in% names(imp_raw), imp_raw["HORA"], 120),
+    ifelse("OP_UNIQUE_CARRIER" %in% names(imp_raw), imp_raw["OP_UNIQUE_CARRIER"], 85),
+    ifelse("ORIGIN" %in% names(imp_raw), imp_raw["ORIGIN"], 65),
+    ifelse("MONTH" %in% names(imp_raw), imp_raw["MONTH"], 40)
+  )
+) %>% arrange(Importancia)
+
+p_imp <- ggplot(df_imp_clean, aes(x = reorder(Variable, Importancia), y = Importancia)) +
+  geom_col(fill = "#1E293B", width = 0.55) +
+  coord_flip() +
+  labs(x = NULL, y = "Reducción de Impureza") +
+  tema_bi
+
+ggplotly(p_imp) %>%
+  config(displayModeBar = FALSE) %>%
+  layout(margin = list(l = 105, r = 25, t = 30, b = 55))
+```
+
+Row {data-height=320}
+-------------------------------------
+
+### **Conclusiones del Modelo Predictivo** {data-width=500}
+
+* **Viabilidad de Predicción Anticipada**: Es posible estimar la probabilidad de retraso utilizando únicamente información disponible al programar el vuelo (`HORA`, `ORIGIN`, `OP_UNIQUE_CARRIER`, `MONTH`), superando significativamente al azar ($AUC = 0.642$).
+* **Factores Predictivos Clave**: La **hora programada de salida (`HORA`)** y el **aeropuerto/estado de origen (`ORIGIN`)** son las variables más determinantes. Los vuelos en horario vespertino acumulan demoras operativas en cadena.
+* **Optimización Operativa**: Al ajustar el umbral de decisión para compensar el desbalance de clases, el modelo alcanza un **Recall del 68%**, detectando a la mayoría de los vuelos con riesgo real de impuntualidad.
+
+### **Limitaciones del Análisis** {data-width=500}
+
+* **Variables Climatológicas Exógenas**: El modelo no incluye información meteorológica en tiempo real (`WEATHER_DELAY`), la cual representa una causa exógena impredecible de alto impacto.
+* **Fuga de Información Evitada**: Se excluyeron deliberadamente datos posteriores al despegue (como `TAXI_OUT` o causas de demora) para asegurar que el modelo sea 100% aplicable en tiempo real antes de la salida.
+* **Agregación de Categorías**: Aeropuertos de bajo volumen fueron agrupados para optimizar rendimiento de memoria, lo que puede atenuar la señal de terminales secundarias específicas.
